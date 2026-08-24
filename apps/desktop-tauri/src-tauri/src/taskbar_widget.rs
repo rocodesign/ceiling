@@ -51,6 +51,9 @@ struct ProviderReadout {
     named_label: Option<String>,
     /// Tile-width spelling of `named_label` for strips too narrow for it.
     named_label_compact: Option<String>,
+    /// Weekly lane, when the provider reports one. Its presence switches the
+    /// tile from the labelled one-line readout to the percent-over-bar layout.
+    weekly: Option<WeeklyBar>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -254,6 +257,106 @@ fn reset_at_rank(window: &crate::commands::RateWindowSnapshot) -> i64 {
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(i64::MAX)
+}
+
+/// Shortest window still spelled `Weekly` by [`compact_window_label`]. Keeping
+/// the two in step stops the bar from claiming a lane the label calls `5h`.
+const MIN_WEEKLY_WINDOW_MINUTES: u32 = 361;
+const MAX_WEEKLY_WINDOW_MINUTES: u32 = 10_080;
+
+/// Mirrors `MIN_WINDOW_MINUTES` in `expectedPace.ts`: "where you should be by
+/// now" assumes even consumption, which is a fair budget for a week and
+/// meaningless for a 5-hour session.
+const MIN_PACED_WINDOW_MINUTES: u32 = 12 * 60;
+
+/// The strip's weekly lane: the bar's edge, and the calendar marker on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WeeklyBar {
+    /// Bar edge, already mirrored for `show_as_used`.
+    edge_percent: u8,
+    /// Marker position, mirrored the same way. `None` when the window does not
+    /// report enough to place it honestly.
+    marker_percent: Option<u8>,
+}
+
+fn is_weekly_lane(label: Option<&str>, window: &crate::commands::RateWindowSnapshot) -> bool {
+    if label.is_some_and(|label| label.to_ascii_lowercase().contains("week")) {
+        return true;
+    }
+    matches!(
+        window.window_minutes,
+        Some(minutes)
+            if (MIN_WEEKLY_WINDOW_MINUTES..=MAX_WEEKLY_WINDOW_MINUTES).contains(&minutes)
+    )
+}
+
+fn weekly_window(
+    snapshot: &crate::commands::ProviderUsageSnapshot,
+) -> Option<&crate::commands::RateWindowSnapshot> {
+    [
+        (snapshot.primary_label.as_deref(), Some(&snapshot.primary)),
+        (
+            snapshot.secondary_label.as_deref(),
+            snapshot.secondary.as_ref(),
+        ),
+        (
+            snapshot.tertiary_label.as_deref(),
+            snapshot.tertiary.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, window)| window.map(|window| (label, window)))
+    .find(|(label, window)| is_weekly_lane(*label, window))
+    .map(|(_, window)| window)
+}
+
+/// Where usage should be by this point in the window, as a percentage.
+///
+/// Port of `expectedUsedPercent` in `expectedPace.ts`: derived from elapsed
+/// time alone, so it needs no pace support from the provider.
+fn elapsed_percent(window: &crate::commands::RateWindowSnapshot, now_ms: i64) -> Option<f64> {
+    let minutes = window.window_minutes?;
+    if minutes < MIN_PACED_WINDOW_MINUTES {
+        return None;
+    }
+    let reset = chrono::DateTime::parse_from_rfc3339(window.resets_at.as_deref()?).ok()?;
+    let duration_ms = i64::from(minutes).checked_mul(60_000)?;
+    let elapsed_ms = now_ms - (reset.timestamp_millis() - duration_ms);
+    if elapsed_ms <= 0 || elapsed_ms >= duration_ms {
+        return None;
+    }
+    Some(elapsed_ms as f64 / duration_ms as f64 * 100.0)
+}
+
+fn weekly_bar(
+    snapshot: &crate::commands::ProviderUsageSnapshot,
+    show_as_used: bool,
+    now_ms: i64,
+) -> Option<WeeklyBar> {
+    let window = weekly_window(snapshot)?;
+    let edge = if show_as_used {
+        window.used_percent
+    } else {
+        window.remaining_percent
+    };
+    let marker = elapsed_percent(window, now_ms).map(|expected| {
+        if show_as_used {
+            expected
+        } else {
+            100.0 - expected
+        }
+    });
+    Some(WeeklyBar {
+        edge_percent: percent_to_u8(edge),
+        marker_percent: marker.map(percent_to_u8),
+    })
+}
+
+fn percent_to_u8(value: f64) -> u8 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.clamp(0.0, 100.0).round() as u8
 }
 
 /// Whether `candidate` should replace `best` as the constraining window.
@@ -1218,6 +1321,7 @@ mod windows_host {
             .get()
             .ok_or_else(|| "Native taskbar widget app handle is unavailable".to_string())?;
         let settings = codexbar::settings::Settings::load();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let preferred_ids = taskbar_strip_provider_ids(&settings);
         let state = app.state::<Mutex<crate::state::AppState>>();
         let guard = state
@@ -1289,6 +1393,11 @@ mod windows_host {
                             named_label_compact: constraining.and_then(|readout| {
                                 compact_named_label(&readout, settings.ui_language)
                             }),
+                            weekly: snapshot
+                                .filter(|snapshot| snapshot.error.is_none())
+                                .and_then(|snapshot| {
+                                    weekly_bar(snapshot, settings.show_as_used, now_ms)
+                                }),
                         }
                     })
                     .collect::<Vec<_>>()
@@ -1713,6 +1822,26 @@ mod windows_host {
                 face.as_ptr(),
             )
         };
+        // The weekly tile leads with its bar, so the number above it is a
+        // caption rather than the headline and drops a size to match.
+        let percent_font = unsafe {
+            CreateFontW(
+                -12,
+                0,
+                0,
+                0,
+                600,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                FONT_QUALITY_ANTIALIASED,
+                0,
+                face.as_ptr(),
+            )
+        };
         let old_font = unsafe { SelectObject(hdc, primary_font) };
         let count = i32::try_from(model.providers.len()).unwrap_or(1).max(1);
         let item_width = (rect.right - rect.left) / count;
@@ -1728,6 +1857,44 @@ mod windows_host {
             let color = provider_color(&provider.provider_id, model.dark_text);
             const ICON_WIDTH: i32 = 16;
             const ICON_TEXT_GAP: i32 = 5;
+            if let Some(weekly) = provider.weekly {
+                let text = wide_without_nul(&format!("{}%", weekly.edge_percent));
+                unsafe {
+                    SelectObject(hdc, percent_font);
+                    let head_width = ICON_WIDTH
+                        .saturating_add(ICON_TEXT_GAP)
+                        .saturating_add(text_width(hdc, &text));
+                    let head_left = centered_content_x(item_left, item_width, head_width);
+                    draw_provider_icon(
+                        hdc,
+                        &provider.provider_id,
+                        head_left + ICON_WIDTH / 2,
+                        middle - 7,
+                        color,
+                    );
+                    SetTextColor(hdc, text_color);
+                    TextOutW(
+                        hdc,
+                        head_left + ICON_WIDTH + ICON_TEXT_GAP,
+                        middle - 15,
+                        text.as_ptr(),
+                        text.len() as i32,
+                    );
+                    SelectObject(hdc, primary_font);
+                    draw_weekly_bar(
+                        hdc, item_left, item_width, middle, weekly, color, text_color,
+                    );
+                }
+                draw_tile_separator(
+                    hdc,
+                    index,
+                    model.providers.len(),
+                    item_left,
+                    item_width,
+                    middle,
+                );
+                continue;
+            }
             // Widest spelling that stays inside this tile. The strip paints
             // without clipping and `centered_content_x` pins overlong content to
             // the cell's left edge, so an unchecked "$1112.92" on a crowded
@@ -1816,28 +1983,111 @@ mod windows_host {
                 SelectObject(hdc, primary_font);
             }
 
-            if index + 1 < model.providers.len() {
-                let separator = unsafe { CreatePen(PS_SOLID, 1, rgb(118, 127, 140)) };
-                let old_pen = unsafe { SelectObject(hdc, separator) };
-                unsafe {
-                    MoveToEx(
-                        hdc,
-                        item_left + item_width - 1,
-                        middle - 13,
-                        std::ptr::null_mut(),
-                    );
-                    LineTo(hdc, item_left + item_width - 1, middle + 13);
-                    SelectObject(hdc, old_pen);
-                    DeleteObject(separator);
-                }
-            }
+            draw_tile_separator(
+                hdc,
+                index,
+                model.providers.len(),
+                item_left,
+                item_width,
+                middle,
+            );
         }
 
         unsafe {
             SelectObject(hdc, old_font);
             DeleteObject(primary_font);
             DeleteObject(detail_font);
+            DeleteObject(percent_font);
             EndPaint(hwnd, &paint);
+        }
+    }
+
+    fn draw_tile_separator(
+        hdc: isize,
+        index: usize,
+        total: usize,
+        item_left: i32,
+        item_width: i32,
+        middle: i32,
+    ) {
+        if index + 1 >= total {
+            return;
+        }
+        let separator = unsafe { CreatePen(PS_SOLID, 1, rgb(118, 127, 140)) };
+        let old_pen = unsafe { SelectObject(hdc, separator) };
+        unsafe {
+            MoveToEx(
+                hdc,
+                item_left + item_width - 1,
+                middle - 13,
+                std::ptr::null_mut(),
+            );
+            LineTo(hdc, item_left + item_width - 1, middle + 13);
+            SelectObject(hdc, old_pen);
+            DeleteObject(separator);
+        }
+    }
+
+    /// The weekly lane: a track, the used fill, and the calendar marker.
+    ///
+    /// Mirrors the Overview bar in `PlanStatusCard`: the marker is where the
+    /// fill edge should be right now, so a fill short of it is under budget.
+    unsafe fn draw_weekly_bar(
+        hdc: isize,
+        item_left: i32,
+        item_width: i32,
+        middle: i32,
+        weekly: WeeklyBar,
+        fill_color: u32,
+        marker_color: u32,
+    ) {
+        const BAR_GUTTER: i32 = 14;
+        const BAR_HEIGHT: i32 = 4;
+        const MARKER_WIDTH: i32 = 2;
+        const MARKER_OVERHANG: i32 = 3;
+
+        let width = item_width.saturating_sub(BAR_GUTTER);
+        if width <= 0 {
+            return;
+        }
+        let left = item_left + (item_width - width) / 2;
+        let top = middle + 5;
+        let bottom = top + BAR_HEIGHT;
+
+        unsafe {
+            fill_rect(hdc, left, top, left + width, bottom, rgb(112, 120, 132));
+            let fill = width * i32::from(weekly.edge_percent) / 100;
+            if fill > 0 {
+                fill_rect(hdc, left, top, left + fill, bottom, fill_color);
+            }
+            if let Some(marker) = weekly.marker_percent {
+                // Clamp so a marker at 0% or 100% keeps its full width inside
+                // the track instead of bleeding into the neighbouring tile.
+                let x = (left + width * i32::from(marker) / 100)
+                    .clamp(left, left + width - MARKER_WIDTH);
+                fill_rect(
+                    hdc,
+                    x,
+                    top - MARKER_OVERHANG,
+                    x + MARKER_WIDTH,
+                    bottom + MARKER_OVERHANG,
+                    marker_color,
+                );
+            }
+        }
+    }
+
+    unsafe fn fill_rect(hdc: isize, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
+        let rect = WinRect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let brush = unsafe { CreateSolidBrush(color) };
+        unsafe {
+            FillRect(hdc, &rect, brush);
+            DeleteObject(brush);
         }
     }
 
@@ -3308,6 +3558,72 @@ mod tests {
             fetch_duration_ms: None,
             wayfinder_usage: None,
         }
+    }
+
+    /// A weekly window whose reset is `remaining` minutes away, so the elapsed
+    /// share of the week is exact rather than wall-clock dependent.
+    fn weekly_window_snapshot(
+        used: f64,
+        remaining_minutes: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::commands::ProviderUsageSnapshot {
+        let mut snapshot = snap("claude", None, 5.0);
+        let mut weekly = rate_window(used, Some(10_080));
+        weekly.resets_at = Some((now + chrono::Duration::minutes(remaining_minutes)).to_rfc3339());
+        snapshot.secondary = Some(weekly);
+        snapshot.secondary_label = Some("Weekly".into());
+        snapshot
+    }
+
+    #[test]
+    fn weekly_lane_is_found_by_label_and_by_duration() {
+        assert!(is_weekly_lane(Some("Weekly"), &rate_window(0.0, None)));
+        assert!(is_weekly_lane(None, &rate_window(0.0, Some(10_080))));
+        assert!(!is_weekly_lane(
+            Some("Session (5h)"),
+            &rate_window(0.0, Some(300))
+        ));
+        // A monthly lane is not the week, and neither is an unbounded one.
+        assert!(!is_weekly_lane(None, &rate_window(0.0, Some(43_200))));
+        assert!(!is_weekly_lane(None, &rate_window(0.0, None)));
+    }
+
+    #[test]
+    fn the_marker_tracks_elapsed_time_not_usage() {
+        let now = chrono::Utc::now();
+        // Three days left of seven: five sevenths of the week are gone.
+        let snapshot = weekly_window_snapshot(10.0, 3 * 24 * 60, now);
+        let bar = weekly_bar(&snapshot, true, now.timestamp_millis()).expect("weekly");
+        assert_eq!(bar.edge_percent, 10);
+        assert_eq!(bar.marker_percent, Some(57));
+    }
+
+    #[test]
+    fn remaining_mode_mirrors_both_the_edge_and_the_marker() {
+        let now = chrono::Utc::now();
+        let snapshot = weekly_window_snapshot(10.0, 3 * 24 * 60, now);
+        let bar = weekly_bar(&snapshot, false, now.timestamp_millis()).expect("weekly");
+        assert_eq!(bar.edge_percent, 90);
+        assert_eq!(bar.marker_percent, Some(43));
+    }
+
+    #[test]
+    fn a_session_only_provider_keeps_the_labelled_tile() {
+        let snapshot = snap("cursor", None, 40.0);
+        assert!(weekly_bar(&snapshot, true, chrono::Utc::now().timestamp_millis()).is_none());
+    }
+
+    /// Without a reset the elapsed share is unknowable, so the bar still draws
+    /// but carries no marker rather than guessing at zero.
+    #[test]
+    fn a_weekly_window_with_no_reset_draws_without_a_marker() {
+        let mut snapshot = snap("claude", None, 5.0);
+        snapshot.secondary = Some(rate_window(64.0, Some(10_080)));
+        snapshot.secondary_label = Some("Weekly".into());
+        let bar =
+            weekly_bar(&snapshot, true, chrono::Utc::now().timestamp_millis()).expect("weekly");
+        assert_eq!(bar.edge_percent, 64);
+        assert_eq!(bar.marker_percent, None);
     }
 
     #[test]
