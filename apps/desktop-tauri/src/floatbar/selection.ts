@@ -1,6 +1,14 @@
 import type { FloatBarSelectionMode } from "../types/bridge";
 
-export function selectVisibleFloatBarProviders<T extends { providerId: string }>(
+type SelectableRow = { providerId: string; accountEmail?: string | null };
+
+// Matches `providerKey` in FloatBar.tsx: a provider can contribute one row per
+// account, so `providerId` alone would collapse a second seat back out.
+function rowKey(row: SelectableRow): string {
+  return `${row.providerId}:${row.accountEmail ?? ""}`;
+}
+
+export function selectVisibleFloatBarProviders<T extends SelectableRow>(
   pinned: T[],
   allEligible: T[],
   options: {
@@ -22,25 +30,24 @@ export function selectVisibleFloatBarProviders<T extends { providerId: string }>
     return pinned;
   }
 
-  const byId = new Map(allEligible.map((row) => [row.providerId, row]));
   const active = lastActiveProviderId
-    ? byId.get(lastActiveProviderId)
-    : undefined;
+    ? allEligible.filter((row) => row.providerId === lastActiveProviderId)
+    : [];
 
-  if (!active) {
+  if (active.length === 0) {
     return pinned;
   }
   if (mode === "active") {
-    return [active];
+    return active;
   }
 
-  const next: T[] = [active];
-  const seen = new Set<string>([active.providerId]);
+  const next: T[] = [...active];
+  const seen = new Set<string>(active.map(rowKey));
   for (const row of pinned) {
-    if (seen.has(row.providerId)) continue;
+    if (seen.has(rowKey(row))) continue;
     if (usedPercent(row) + 1e-9 >= highUsageThreshold) {
       next.push(row);
-      seen.add(row.providerId);
+      seen.add(rowKey(row));
     }
   }
   return next.length > 0 ? next : pinned;

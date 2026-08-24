@@ -611,20 +611,21 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
     const eligible = providers.filter(
       (p) => enabled.has(p.providerId) && isFloatBarEligible(p),
     );
-    // One pill per provider: pin wins, else hottest account.
+    // One pill per account, kept adjacent per provider. A pin narrows its
+    // provider to that one account.
     const byProvider = new Map<string, typeof eligible>();
     for (const row of eligible) {
       const group = byProvider.get(row.providerId) ?? [];
       group.push(row);
       byProvider.set(row.providerId, group);
     }
-    const pick = (providerId: string) => {
+    const pick = (providerId: string): typeof eligible => {
       const group = byProvider.get(providerId) ?? [];
-      if (group.length === 0) return undefined;
+      if (group.length === 0) return [];
       const want = pinnedAccounts[providerId]?.trim();
       if (want) {
         const hit = group.find((row) => row.accountId === want);
-        if (hit) return hit;
+        if (hit) return [hit];
       }
       return [...group].sort((a, b) => {
         const delta =
@@ -633,20 +634,24 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
         // Lowest account id, matching the native strip and the flyout so all
         // three name the same seat when two accounts read the same pressure.
         return compareAccountIds(a.accountId, b.accountId);
-      })[0];
+      });
     };
+    const picked = new Map<string, typeof eligible>();
+    for (const providerId of byProvider.keys()) {
+      const rows = pick(providerId);
+      if (rows.length > 0) picked.set(providerId, rows);
+    }
+    // Rank a provider by its hottest shown account, so a second account never
+    // separates a provider's pills from each other.
+    const groupHeat = (providerId: string) =>
+      Math.max(...(picked.get(providerId) ?? []).map((row) => floatBarHeat(row)));
     const pinned =
       filterIds && filterIds.length > 0
-        ? filterIds
-            .map((id) => pick(id))
-            .filter((p): p is (typeof eligible)[number] => p !== undefined)
-        : [...byProvider.keys()]
-            .map((id) => pick(id))
-            .filter((p): p is (typeof eligible)[number] => p !== undefined)
-            .sort((a, b) => floatBarHeat(b) - floatBarHeat(a));
-    const allEligible = [...byProvider.keys()]
-      .map((id) => pick(id))
-      .filter((p): p is (typeof eligible)[number] => p !== undefined);
+        ? filterIds.flatMap((id) => picked.get(id) ?? [])
+        : [...picked.keys()]
+            .sort((a, b) => groupHeat(b) - groupHeat(a))
+            .flatMap((id) => picked.get(id) ?? []);
+    const allEligible = [...picked.values()].flat();
     return selectVisibleFloatBarProviders(pinned, allEligible, {
       mode: selectionMode,
       detectionEnabled: settings.floatBarForegroundDetection,
