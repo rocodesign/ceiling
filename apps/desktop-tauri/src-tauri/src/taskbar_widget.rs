@@ -466,25 +466,26 @@ fn constraining_readout(
     best
 }
 
-/// Pick the reading to show on a one-tile-per-provider strip.
+/// Pick the readings to show for one provider, hottest account first.
 ///
-/// When `preferred_account_id` is set and that account is in the cache, use it.
-/// Otherwise pick the account closest to its constraining limit (stable across
-/// fetch order).
-fn select_strip_snapshot<'a, I>(
+/// When `preferred_account_id` is set and that account is in the cache, it is
+/// the only reading returned. Otherwise every account gets its own tile,
+/// ordered by how close it sits to its constraining limit (stable across fetch
+/// order).
+fn select_strip_snapshots<'a, I>(
     cache: I,
     provider_id: &str,
     preferred_account_id: Option<&str>,
-) -> Option<&'a crate::commands::ProviderUsageSnapshot>
+) -> Vec<&'a crate::commands::ProviderUsageSnapshot>
 where
     I: IntoIterator<Item = &'a crate::commands::ProviderUsageSnapshot>,
 {
-    let candidates: Vec<_> = cache
+    let mut candidates: Vec<_> = cache
         .into_iter()
         .filter(|snapshot| snapshot.provider_id == provider_id)
         .collect();
     if candidates.is_empty() {
-        return None;
+        return Vec::new();
     }
     if let Some(want) = preferred_account_id
         .map(str::trim)
@@ -493,13 +494,14 @@ where
             .iter()
             .find(|snapshot| snapshot.account_id.as_deref() == Some(want))
     {
-        return Some(*hit);
+        return vec![*hit];
     }
-    candidates.into_iter().max_by(|a, b| {
-        strip_heat(a)
-            .total_cmp(&strip_heat(b))
-            .then_with(|| b.account_id.cmp(&a.account_id))
-    })
+    candidates.sort_by(|a, b| {
+        strip_heat(b)
+            .total_cmp(&strip_heat(a))
+            .then_with(|| a.account_id.cmp(&b.account_id))
+    });
+    candidates
 }
 
 fn layout_is_enabled(layout: &TaskbarLayout, all_monitors: bool) -> bool {
@@ -1224,56 +1226,72 @@ mod windows_host {
 
         let providers = preferred_ids
             .into_iter()
-            .map(|provider_id| {
-                // One tile per provider. Default picks the account closest to
-                // its limit (stable across fetch order). Users can pin a
-                // specific Codex/Claude account in Settings → Taskbar Usage.
+            .flat_map(|provider_id| {
+                // One tile per account, hottest first. Users can pin a specific
+                // Codex/Claude account in Settings → Taskbar Usage to collapse a
+                // provider back to a single tile.
                 let preferred = settings.taskbar_account_for(&provider_id);
-                let snapshot = super::select_strip_snapshot(
+                let snapshots = super::select_strip_snapshots(
                     guard.provider_cache.iter(),
                     &provider_id,
                     preferred,
                 );
-                // One-number strip: surface the constraining window, not always
-                // the primary session. Claude weekly at 100% with a fresh 5h
-                // session must read as Weekly / 100%, not 5h / 0%.
-                let constraining = snapshot
-                    .filter(|snapshot| snapshot.error.is_none())
-                    .map(super::constraining_readout);
-                let percent = constraining
-                    .and_then(|readout| strip_readout_percent(&readout, settings.show_as_used));
-                // A spend lane's headline is the money, not the fraction.
-                let spend = constraining.and_then(|readout| readout.amount);
-                let amount_label =
-                    spend.and_then(|amount| strip_amount_label(amount, settings.show_as_used));
-                let amount_label_compact =
-                    spend.and_then(|amount| compact_amount_label(amount, settings.show_as_used));
-                ProviderReadout {
-                    provider_id,
-                    percent,
-                    amount_label,
-                    amount_label_compact,
-                    // Window label only (Weekly / 5h). Account identity lives in
-                    // the flyout (On strip + account line); long tags collide
-                    // with the next tile on the compact strip.
-                    window_label: compact_window_label(
-                        constraining.and_then(|readout| readout.label).or_else(|| {
-                            snapshot.and_then(|snapshot| snapshot.primary_label.as_deref())
-                        }),
-                        constraining
-                            .map(|readout| readout.window.window_minutes)
-                            .unwrap_or_else(|| {
-                                snapshot.and_then(|snapshot| snapshot.primary.window_minutes)
+                // An enabled provider with no reading yet still holds one tile,
+                // so setup stays visible instead of the provider vanishing.
+                let rows: Vec<Option<&crate::commands::ProviderUsageSnapshot>> =
+                    if snapshots.is_empty() {
+                        vec![None]
+                    } else {
+                        snapshots.into_iter().map(Some).collect()
+                    };
+                rows.into_iter()
+                    .map(|snapshot| {
+                        // One-number strip: surface the constraining window, not always
+                        // the primary session. Claude weekly at 100% with a fresh 5h
+                        // session must read as Weekly / 100%, not 5h / 0%.
+                        let constraining = snapshot
+                            .filter(|snapshot| snapshot.error.is_none())
+                            .map(super::constraining_readout);
+                        let percent = constraining.and_then(|readout| {
+                            strip_readout_percent(&readout, settings.show_as_used)
+                        });
+                        // A spend lane's headline is the money, not the fraction.
+                        let spend = constraining.and_then(|readout| readout.amount);
+                        let amount_label = spend
+                            .and_then(|amount| strip_amount_label(amount, settings.show_as_used));
+                        let amount_label_compact = spend
+                            .and_then(|amount| compact_amount_label(amount, settings.show_as_used));
+                        ProviderReadout {
+                            provider_id: provider_id.clone(),
+                            percent,
+                            amount_label,
+                            amount_label_compact,
+                            // Window label only (Weekly / 5h). Account identity lives in
+                            // the flyout (On strip + account line); long tags collide
+                            // with the next tile on the compact strip.
+                            window_label: compact_window_label(
+                                constraining.and_then(|readout| readout.label).or_else(|| {
+                                    snapshot.and_then(|snapshot| snapshot.primary_label.as_deref())
+                                }),
+                                constraining
+                                    .map(|readout| readout.window.window_minutes)
+                                    .unwrap_or_else(|| {
+                                        snapshot
+                                            .and_then(|snapshot| snapshot.primary.window_minutes)
+                                    }),
+                            ),
+                            reset: constraining.and_then(|readout| {
+                                strip_reset_label(&readout, settings.float_bar_show_reset_inline)
                             }),
-                    ),
-                    reset: constraining.and_then(|readout| {
-                        strip_reset_label(&readout, settings.float_bar_show_reset_inline)
-                    }),
-                    named_label: constraining
-                        .and_then(|readout| strip_named_label(&readout, settings.ui_language)),
-                    named_label_compact: constraining
-                        .and_then(|readout| compact_named_label(&readout, settings.ui_language)),
-                }
+                            named_label: constraining.and_then(|readout| {
+                                strip_named_label(&readout, settings.ui_language)
+                            }),
+                            named_label_compact: constraining.and_then(|readout| {
+                                compact_named_label(&readout, settings.ui_language)
+                            }),
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
 
@@ -3298,7 +3316,7 @@ mod tests {
             snap("codex", Some("personal"), 20.0),
             snap("codex", Some("work"), 80.0),
         ];
-        let picked = select_strip_snapshot(cache.iter(), "codex", None).unwrap();
+        let picked = select_strip_snapshots(cache.iter(), "codex", None)[0];
         assert_eq!(picked.account_id.as_deref(), Some("work"));
     }
 
@@ -3323,7 +3341,7 @@ mod tests {
         failed.error = Some("network timeout".into());
 
         let cache = [failed, unavailable];
-        let picked = select_strip_snapshot(cache.iter(), "cursor", None).unwrap();
+        let picked = select_strip_snapshots(cache.iter(), "cursor", None)[0];
 
         assert_eq!(picked.account_id.as_deref(), Some("good"));
         assert!(picked.error.is_none());
@@ -3331,7 +3349,7 @@ mod tests {
         // A real reading still beats both.
         let mut cache = cache.to_vec();
         cache.push(snap("cursor", Some("hot"), 42.0));
-        let picked = select_strip_snapshot(cache.iter(), "cursor", None).unwrap();
+        let picked = select_strip_snapshots(cache.iter(), "cursor", None)[0];
         assert_eq!(picked.account_id.as_deref(), Some("hot"));
     }
 
@@ -3341,7 +3359,7 @@ mod tests {
             snap("codex", Some("personal"), 20.0),
             snap("codex", Some("work"), 80.0),
         ];
-        let picked = select_strip_snapshot(cache.iter(), "codex", Some("personal")).unwrap();
+        let picked = select_strip_snapshots(cache.iter(), "codex", Some("personal"))[0];
         assert_eq!(picked.account_id.as_deref(), Some("personal"));
     }
 
@@ -3351,8 +3369,39 @@ mod tests {
             snap("codex", Some("personal"), 20.0),
             snap("codex", Some("work"), 80.0),
         ];
-        let picked = select_strip_snapshot(cache.iter(), "codex", Some("gone")).unwrap();
+        let picked = select_strip_snapshots(cache.iter(), "codex", Some("gone"))[0];
         assert_eq!(picked.account_id.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn strip_snapshots_return_every_account_hottest_first() {
+        let cache = [
+            snap("claude", Some("personal"), 20.0),
+            snap("claude", Some("work"), 80.0),
+        ];
+        let picked = select_strip_snapshots(cache.iter(), "claude", None);
+        let ids: Vec<_> = picked
+            .iter()
+            .map(|snapshot| snapshot.account_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec![Some("work"), Some("personal")]);
+    }
+
+    #[test]
+    fn a_pin_collapses_its_provider_back_to_one_tile() {
+        let cache = [
+            snap("claude", Some("personal"), 20.0),
+            snap("claude", Some("work"), 80.0),
+        ];
+        let picked = select_strip_snapshots(cache.iter(), "claude", Some("personal"));
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].account_id.as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn strip_snapshots_are_empty_when_the_provider_has_no_reading() {
+        let cache = [snap("codex", Some("personal"), 20.0)];
+        assert!(select_strip_snapshots(cache.iter(), "claude", None).is_empty());
     }
 
     #[test]
@@ -3431,7 +3480,7 @@ mod tests {
         let genuinely_hot = snap("claude", Some("work"), 80.0);
 
         let cache = [quiet_but_fable_maxed, genuinely_hot];
-        let picked = select_strip_snapshot(cache.iter(), "claude", None).unwrap();
+        let picked = select_strip_snapshots(cache.iter(), "claude", None)[0];
         assert_eq!(picked.account_id.as_deref(), Some("work"));
     }
 
@@ -3923,7 +3972,7 @@ mod tests {
         busy_session.secondary_label = Some("Weekly".into());
 
         let cache = [calm_session, busy_session];
-        let picked = select_strip_snapshot(cache.iter(), "claude", None).unwrap();
+        let picked = select_strip_snapshots(cache.iter(), "claude", None)[0];
         assert_eq!(picked.account_id.as_deref(), Some("a"));
     }
 
