@@ -2228,7 +2228,9 @@ mod windows_host {
         const MARKER_WIDTH: i32 = 2;
         const MARKER_OVERHANG: i32 = 3;
         const SESSION_GAP: i32 = 1;
-        const SESSION_HEIGHT: i32 = 1;
+        const SESSION_HEIGHT: i32 = 2;
+        /// Square, so the dot reads as a dot rather than as a short tick.
+        const SESSION_MARKER: i32 = SESSION_HEIGHT;
 
         let width = item_width.saturating_sub(TILE_GUTTER);
         if width <= 0 {
@@ -2282,8 +2284,16 @@ mod windows_host {
                     fill_rect(hdc, left, line_top, left + fill, line_bottom, fill_color);
                 }
                 if let Some(marker) = session.marker_percent {
-                    let x = (left + width * i32::from(marker) / 100).clamp(left, left + width - 1);
-                    fill_rect(hdc, x, line_top, x + 1, line_bottom, marker_color);
+                    let x = (left + width * i32::from(marker) / 100)
+                        .clamp(left, left + width - SESSION_MARKER);
+                    fill_rect(
+                        hdc,
+                        x,
+                        line_top,
+                        x + SESSION_MARKER,
+                        line_bottom,
+                        marker_color,
+                    );
                 }
             }
         }
