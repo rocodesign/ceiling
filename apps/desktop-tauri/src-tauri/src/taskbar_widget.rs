@@ -54,6 +54,9 @@ struct ProviderReadout {
     /// Weekly lane, when the provider reports one. Its presence switches the
     /// tile from the labelled one-line readout to the percent-over-bar layout.
     weekly: Option<WeeklyBar>,
+    /// Tag telling one seat of this provider from another. `None` when the
+    /// provider holds a single tile, where a tag would be noise.
+    account_letter: Option<char>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -357,6 +360,79 @@ fn percent_to_u8(value: f64) -> u8 {
         return 0;
     }
     value.clamp(0.0, 100.0).round() as u8
+}
+
+/// Space either side of a tile's bar. The icon and the percent line up with the
+/// bar's left edge and the account tag with its right, so one value sets the
+/// whole tile's margin.
+const TILE_GUTTER: i32 = 14;
+
+/// One tag per tile so two seats of the same provider stay apart at a glance.
+///
+/// A provider with a single tile gets none: the icon already identifies it, and
+/// a tag there would be noise.
+fn account_letters(rows: &[Option<&crate::commands::ProviderUsageSnapshot>]) -> Vec<Option<char>> {
+    if rows.len() < 2 {
+        return vec![None; rows.len()];
+    }
+    let preferred: Vec<Option<char>> = rows
+        .iter()
+        .map(|row| row.and_then(account_letter))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let all_distinct = preferred
+        .iter()
+        .all(|letter| letter.is_some_and(|letter| seen.insert(letter)));
+    if all_distinct {
+        return preferred;
+    }
+    // Mixing schemes reads worse than one plain scheme: if any seat cannot get
+    // a distinct initial, letter them all positionally instead.
+    (0..rows.len())
+        .map(|index| char::from_u32(u32::from(b'A') + index as u32))
+        .collect()
+}
+
+/// The most distinguishing initial available for a seat.
+///
+/// The organization comes first because that is what separates a work seat from
+/// a personal one. Two seats belonging to one person share an email local part,
+/// so the domain outranks the address itself.
+fn account_letter(snapshot: &crate::commands::ProviderUsageSnapshot) -> Option<char> {
+    let email = snapshot.account_email.as_deref();
+    let organization = snapshot
+        .account_organization
+        .as_deref()
+        .filter(|organization| !restates_email(organization, email));
+    let domain = email
+        .and_then(|email| email.split('@').nth(1))
+        .and_then(|domain| domain.split('.').next());
+    [
+        organization,
+        domain,
+        email,
+        snapshot.account_label.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(initial)
+}
+
+fn initial(value: &str) -> Option<char> {
+    value
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .and_then(|character| character.to_uppercase().next())
+}
+
+/// A personal Claude account gets an organization named `<email>'s
+/// Organization`, which is the address again and so separates nothing.
+fn restates_email(organization: &str, email: Option<&str>) -> bool {
+    email.is_some_and(|email| {
+        organization
+            .to_ascii_lowercase()
+            .starts_with(&email.to_ascii_lowercase())
+    })
 }
 
 /// Whether `candidate` should replace `best` as the constraining window.
@@ -1348,8 +1424,10 @@ mod windows_host {
                     } else {
                         snapshots.into_iter().map(Some).collect()
                     };
+                let letters = account_letters(&rows);
                 rows.into_iter()
-                    .map(|snapshot| {
+                    .zip(letters)
+                    .map(|(snapshot, account_letter)| {
                         // One-number strip: surface the constraining window, not always
                         // the primary session. Claude weekly at 100% with a fresh 5h
                         // session must read as Weekly / 100%, not 5h / 0%.
@@ -1398,6 +1476,7 @@ mod windows_host {
                                 .and_then(|snapshot| {
                                     weekly_bar(snapshot, settings.show_as_used, now_ms)
                                 }),
+                            account_letter,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -1861,10 +1940,9 @@ mod windows_host {
                 let text = wide_without_nul(&format!("{}%", weekly.edge_percent));
                 unsafe {
                     SelectObject(hdc, percent_font);
-                    let head_width = ICON_WIDTH
-                        .saturating_add(ICON_TEXT_GAP)
-                        .saturating_add(text_width(hdc, &text));
-                    let head_left = centered_content_x(item_left, item_width, head_width);
+                    // Flush with the bar's left edge below, so the icon, the
+                    // number and the track all start on one vertical line.
+                    let head_left = item_left + TILE_GUTTER / 2;
                     draw_provider_icon(
                         hdc,
                         &provider.provider_id,
@@ -1873,13 +1951,24 @@ mod windows_host {
                         color,
                     );
                     SetTextColor(hdc, text_color);
+                    let percent_left = head_left + ICON_WIDTH + ICON_TEXT_GAP;
                     TextOutW(
                         hdc,
-                        head_left + ICON_WIDTH + ICON_TEXT_GAP,
+                        percent_left,
                         middle - 15,
                         text.as_ptr(),
                         text.len() as i32,
                     );
+                    if let Some(letter) = provider.account_letter {
+                        let tag = wide_without_nul(&letter.to_string());
+                        let tag_left =
+                            item_left + item_width - TILE_GUTTER / 2 - text_width(hdc, &tag);
+                        // Drop the tag rather than overprint the percent when a
+                        // crowded strip leaves no gap between the two.
+                        if tag_left > percent_left + text_width(hdc, &text) + ICON_TEXT_GAP {
+                            TextOutW(hdc, tag_left, middle - 15, tag.as_ptr(), tag.len() as i32);
+                        }
+                    }
                     SelectObject(hdc, primary_font);
                     draw_weekly_bar(
                         hdc, item_left, item_width, middle, weekly, color, text_color,
@@ -2041,12 +2130,11 @@ mod windows_host {
         fill_color: u32,
         marker_color: u32,
     ) {
-        const BAR_GUTTER: i32 = 14;
         const BAR_HEIGHT: i32 = 4;
         const MARKER_WIDTH: i32 = 2;
         const MARKER_OVERHANG: i32 = 3;
 
-        let width = item_width.saturating_sub(BAR_GUTTER);
+        let width = item_width.saturating_sub(TILE_GUTTER);
         if width <= 0 {
             return;
         }
@@ -3573,6 +3661,55 @@ mod tests {
         snapshot.secondary = Some(weekly);
         snapshot.secondary_label = Some("Weekly".into());
         snapshot
+    }
+
+    fn seat(email: &str, organization: Option<&str>) -> crate::commands::ProviderUsageSnapshot {
+        let mut snapshot = snap("claude", Some(email), 10.0);
+        snapshot.account_email = Some(email.into());
+        snapshot.account_organization = organization.map(str::to_string);
+        snapshot
+    }
+
+    /// The real pair this was built for: one person, two Claude seats, so the
+    /// email local part is identical and only the organization/domain differ.
+    #[test]
+    fn two_seats_of_one_person_get_distinct_letters() {
+        let personal = seat(
+            "romeo@copaciu.com",
+            Some("romeo@copaciu.com's Organization"),
+        );
+        let work = seat("romeo.copaciu@toptal.com", Some("Toptal Core"));
+        let letters = account_letters(&[Some(&personal), Some(&work)]);
+        // Personal falls through to its domain because its organization only
+        // restates the address; work takes its organization initial.
+        assert_eq!(letters, vec![Some('C'), Some('T')]);
+    }
+
+    #[test]
+    fn a_single_seat_gets_no_letter() {
+        let only = seat("romeo@copaciu.com", None);
+        assert_eq!(account_letters(&[Some(&only)]), vec![None]);
+    }
+
+    #[test]
+    fn colliding_initials_fall_back_to_positional_letters() {
+        let first = seat("sam@acme.com", Some("Acme"));
+        let second = seat("kim@acme.com", Some("Acme Labs"));
+        assert_eq!(
+            account_letters(&[Some(&first), Some(&second)]),
+            vec![Some('A'), Some('B')],
+        );
+    }
+
+    /// A seat still fetching has no identity to draw an initial from, so the
+    /// pair must not end up with one tagged tile and one bare one.
+    #[test]
+    fn an_unreadable_seat_forces_positional_letters() {
+        let known = seat("romeo@copaciu.com", Some("Toptal Core"));
+        assert_eq!(
+            account_letters(&[Some(&known), None]),
+            vec![Some('A'), Some('B')],
+        );
     }
 
     #[test]
