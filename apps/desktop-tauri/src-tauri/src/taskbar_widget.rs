@@ -53,7 +53,10 @@ struct ProviderReadout {
     named_label_compact: Option<String>,
     /// Weekly lane, when the provider reports one. Its presence switches the
     /// tile from the labelled one-line readout to the percent-over-bar layout.
-    weekly: Option<WeeklyBar>,
+    weekly: Option<LaneBar>,
+    /// Session lane, drawn as a hairline under the weekly bar. Only drawn
+    /// alongside a weekly bar, never on its own.
+    session: Option<LaneBar>,
     /// Tag telling one seat of this provider from another. `None` when the
     /// provider holds a single tile, where a tag would be noise.
     account_letter: Option<char>,
@@ -272,9 +275,13 @@ const MAX_WEEKLY_WINDOW_MINUTES: u32 = 10_080;
 /// meaningless for a 5-hour session.
 const MIN_PACED_WINDOW_MINUTES: u32 = 12 * 60;
 
-/// The strip's weekly lane: the bar's edge, and the calendar marker on it.
+/// Longest window still treated as the session lane, matching the `5h` spelling
+/// in [`compact_window_label`].
+const MAX_SESSION_WINDOW_MINUTES: u32 = 360;
+
+/// One rate window as the strip draws it: a filled edge and a marker on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WeeklyBar {
+struct LaneBar {
     /// Bar edge, already mirrored for `show_as_used`.
     edge_percent: u8,
     /// Marker position, mirrored the same way. `None` when the window does not
@@ -293,9 +300,9 @@ fn is_weekly_lane(label: Option<&str>, window: &crate::commands::RateWindowSnaps
     )
 }
 
-fn weekly_window(
+fn labelled_lanes(
     snapshot: &crate::commands::ProviderUsageSnapshot,
-) -> Option<&crate::commands::RateWindowSnapshot> {
+) -> impl Iterator<Item = (Option<&str>, &crate::commands::RateWindowSnapshot)> {
     [
         (snapshot.primary_label.as_deref(), Some(&snapshot.primary)),
         (
@@ -309,19 +316,25 @@ fn weekly_window(
     ]
     .into_iter()
     .filter_map(|(label, window)| window.map(|window| (label, window)))
-    .find(|(label, window)| is_weekly_lane(*label, window))
-    .map(|(_, window)| window)
 }
 
-/// Where usage should be by this point in the window, as a percentage.
+fn weekly_window(
+    snapshot: &crate::commands::ProviderUsageSnapshot,
+) -> Option<&crate::commands::RateWindowSnapshot> {
+    labelled_lanes(snapshot)
+        .find(|(label, window)| is_weekly_lane(*label, window))
+        .map(|(_, window)| window)
+}
+
+/// How far through its window this lane is, as a percentage.
 ///
-/// Port of `expectedUsedPercent` in `expectedPace.ts`: derived from elapsed
-/// time alone, so it needs no pace support from the provider.
+/// Port of `expectedUsedPercent` in `expectedPace.ts` minus its minimum-length
+/// rule. That rule is about budgeting — "where you should be by now" is
+/// meaningless for a session — but the session hairline uses this as a plain
+/// countdown to the next reset, which is honest at any length. Callers that
+/// read it as a budget apply [`MIN_PACED_WINDOW_MINUTES`] themselves.
 fn elapsed_percent(window: &crate::commands::RateWindowSnapshot, now_ms: i64) -> Option<f64> {
     let minutes = window.window_minutes?;
-    if minutes < MIN_PACED_WINDOW_MINUTES {
-        return None;
-    }
     let reset = chrono::DateTime::parse_from_rfc3339(window.resets_at.as_deref()?).ok()?;
     let duration_ms = i64::from(minutes).checked_mul(60_000)?;
     let elapsed_ms = now_ms - (reset.timestamp_millis() - duration_ms);
@@ -331,28 +344,80 @@ fn elapsed_percent(window: &crate::commands::RateWindowSnapshot, now_ms: i64) ->
     Some(elapsed_ms as f64 / duration_ms as f64 * 100.0)
 }
 
-fn weekly_bar(
-    snapshot: &crate::commands::ProviderUsageSnapshot,
+fn lane_bar(
+    window: &crate::commands::RateWindowSnapshot,
     show_as_used: bool,
     now_ms: i64,
-) -> Option<WeeklyBar> {
-    let window = weekly_window(snapshot)?;
+    paced_only: bool,
+) -> LaneBar {
     let edge = if show_as_used {
         window.used_percent
     } else {
         window.remaining_percent
     };
-    let marker = elapsed_percent(window, now_ms).map(|expected| {
-        if show_as_used {
-            expected
-        } else {
-            100.0 - expected
-        }
-    });
-    Some(WeeklyBar {
+    let paced = !paced_only
+        || window
+            .window_minutes
+            .is_some_and(|minutes| minutes >= MIN_PACED_WINDOW_MINUTES);
+    let marker = paced
+        .then(|| elapsed_percent(window, now_ms))
+        .flatten()
+        .map(|expected| {
+            if show_as_used {
+                expected
+            } else {
+                100.0 - expected
+            }
+        });
+    LaneBar {
         edge_percent: percent_to_u8(edge),
         marker_percent: marker.map(percent_to_u8),
-    })
+    }
+}
+
+fn weekly_bar(
+    snapshot: &crate::commands::ProviderUsageSnapshot,
+    show_as_used: bool,
+    now_ms: i64,
+) -> Option<LaneBar> {
+    Some(lane_bar(
+        weekly_window(snapshot)?,
+        show_as_used,
+        now_ms,
+        true,
+    ))
+}
+
+/// The session lane, drawn as a hairline under the weekly bar.
+fn session_line(
+    snapshot: &crate::commands::ProviderUsageSnapshot,
+    show_as_used: bool,
+    now_ms: i64,
+) -> Option<LaneBar> {
+    Some(lane_bar(
+        session_window(snapshot)?,
+        show_as_used,
+        now_ms,
+        false,
+    ))
+}
+
+fn is_session_lane(label: Option<&str>, window: &crate::commands::RateWindowSnapshot) -> bool {
+    if label.is_some_and(|label| {
+        let normalized = label.to_ascii_lowercase();
+        normalized.contains("session") || normalized.contains("hour")
+    }) {
+        return true;
+    }
+    matches!(window.window_minutes, Some(minutes) if minutes <= MAX_SESSION_WINDOW_MINUTES)
+}
+
+fn session_window(
+    snapshot: &crate::commands::ProviderUsageSnapshot,
+) -> Option<&crate::commands::RateWindowSnapshot> {
+    labelled_lanes(snapshot)
+        .find(|(label, window)| is_session_lane(*label, window))
+        .map(|(_, window)| window)
 }
 
 fn percent_to_u8(value: f64) -> u8 {
@@ -1476,6 +1541,11 @@ mod windows_host {
                                 .and_then(|snapshot| {
                                     weekly_bar(snapshot, settings.show_as_used, now_ms)
                                 }),
+                            session: snapshot
+                                .filter(|snapshot| snapshot.error.is_none())
+                                .and_then(|snapshot| {
+                                    session_line(snapshot, settings.show_as_used, now_ms)
+                                }),
                             account_letter,
                         }
                     })
@@ -1902,14 +1972,15 @@ mod windows_host {
             )
         };
         // The weekly tile leads with its bar, so the number above it is a
-        // caption rather than the headline and drops a size to match.
+        // caption rather than the headline and drops a size and a weight to
+        // match.
         let percent_font = unsafe {
             CreateFontW(
                 -12,
                 0,
                 0,
                 0,
-                600,
+                400,
                 0,
                 0,
                 0,
@@ -1970,8 +2041,17 @@ mod windows_host {
                         }
                     }
                     SelectObject(hdc, primary_font);
-                    draw_weekly_bar(
-                        hdc, item_left, item_width, middle, weekly, color, text_color,
+                    draw_lane_bars(
+                        hdc,
+                        LaneLayout {
+                            item_left,
+                            item_width,
+                            middle,
+                            fill_color: color,
+                            marker_color: text_color,
+                        },
+                        weekly,
+                        provider.session,
                     );
                 }
                 draw_tile_separator(
@@ -2117,22 +2197,38 @@ mod windows_host {
         }
     }
 
-    /// The weekly lane: a track, the used fill, and the calendar marker.
-    ///
-    /// Mirrors the Overview bar in `PlanStatusCard`: the marker is where the
-    /// fill edge should be right now, so a fill short of it is under budget.
-    unsafe fn draw_weekly_bar(
-        hdc: isize,
+    /// Where a tile's lanes are drawn, and in what colours.
+    #[derive(Clone, Copy)]
+    struct LaneLayout {
         item_left: i32,
         item_width: i32,
         middle: i32,
-        weekly: WeeklyBar,
         fill_color: u32,
         marker_color: u32,
+    }
+
+    /// The weekly bar, and the session hairline under it.
+    ///
+    /// Mirrors the Overview bar in `PlanStatusCard`: the marker is where the
+    /// fill edge should be right now, so a fill short of it is under budget.
+    unsafe fn draw_lane_bars(
+        hdc: isize,
+        layout: LaneLayout,
+        weekly: LaneBar,
+        session: Option<LaneBar>,
     ) {
+        let LaneLayout {
+            item_left,
+            item_width,
+            middle,
+            fill_color,
+            marker_color,
+        } = layout;
         const BAR_HEIGHT: i32 = 4;
         const MARKER_WIDTH: i32 = 2;
         const MARKER_OVERHANG: i32 = 3;
+        const SESSION_GAP: i32 = 1;
+        const SESSION_HEIGHT: i32 = 1;
 
         let width = item_width.saturating_sub(TILE_GUTTER);
         if width <= 0 {
@@ -2153,14 +2249,42 @@ mod windows_host {
                 // the track instead of bleeding into the neighbouring tile.
                 let x = (left + width * i32::from(marker) / 100)
                     .clamp(left, left + width - MARKER_WIDTH);
+                // The session hairline sits one pixel below the bar, so the
+                // marker may only overhang downwards when there is no hairline
+                // for it to run into.
+                let overhang_below = if session.is_some() {
+                    0
+                } else {
+                    MARKER_OVERHANG
+                };
                 fill_rect(
                     hdc,
                     x,
                     top - MARKER_OVERHANG,
                     x + MARKER_WIDTH,
-                    bottom + MARKER_OVERHANG,
+                    bottom + overhang_below,
                     marker_color,
                 );
+            }
+            if let Some(session) = session {
+                let line_top = bottom + SESSION_GAP;
+                let line_bottom = line_top + SESSION_HEIGHT;
+                fill_rect(
+                    hdc,
+                    left,
+                    line_top,
+                    left + width,
+                    line_bottom,
+                    rgb(112, 120, 132),
+                );
+                let fill = width * i32::from(session.edge_percent) / 100;
+                if fill > 0 {
+                    fill_rect(hdc, left, line_top, left + fill, line_bottom, fill_color);
+                }
+                if let Some(marker) = session.marker_percent {
+                    let x = (left + width * i32::from(marker) / 100).clamp(left, left + width - 1);
+                    fill_rect(hdc, x, line_top, x + 1, line_bottom, marker_color);
+                }
             }
         }
     }
@@ -3742,6 +3866,38 @@ mod tests {
         let bar = weekly_bar(&snapshot, false, now.timestamp_millis()).expect("weekly");
         assert_eq!(bar.edge_percent, 90);
         assert_eq!(bar.marker_percent, Some(43));
+    }
+
+    /// The session marker is a countdown, not a budget, so it must survive the
+    /// minimum-length rule that suppresses the weekly one.
+    #[test]
+    fn the_session_marker_tracks_a_window_too_short_to_pace() {
+        let now = chrono::Utc::now();
+        let mut snapshot = snap("claude", None, 20.0);
+        let mut session = rate_window(20.0, Some(300));
+        // Three of five hours gone.
+        session.resets_at = Some((now + chrono::Duration::minutes(120)).to_rfc3339());
+        snapshot.primary = session;
+        snapshot.primary_label = Some("Session (5h)".into());
+        let line = session_line(&snapshot, true, now.timestamp_millis()).expect("session");
+        assert_eq!(line.edge_percent, 20);
+        assert_eq!(line.marker_percent, Some(60));
+        // The same window read as a weekly budget still yields no marker.
+        assert_eq!(
+            lane_bar(&snapshot.primary, true, now.timestamp_millis(), true).marker_percent,
+            None,
+        );
+    }
+
+    #[test]
+    fn the_session_lane_is_not_the_weekly_one() {
+        let now = chrono::Utc::now();
+        let snapshot = weekly_window_snapshot(64.0, 3 * 24 * 60, now);
+        // `snap` builds a 300-minute primary labelled "Session".
+        let session = session_window(&snapshot).expect("session");
+        assert_eq!(session.window_minutes, Some(300));
+        let weekly = weekly_window(&snapshot).expect("weekly");
+        assert_eq!(weekly.window_minutes, Some(10_080));
     }
 
     #[test]
