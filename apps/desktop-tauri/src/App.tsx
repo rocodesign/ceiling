@@ -2,8 +2,6 @@ import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
-  checkForUpdates,
-  downloadUpdate,
   getBootstrapState,
   getSettingsSnapshot,
   setSurfaceMode,
@@ -86,20 +84,6 @@ function AppInner() {
         }
       });
 
-    // Fire-and-forget update checks after the first paint so startup/tray open
-    // is not competing with network work.
-    const updateTimer = auxiliaryWindow
-      ? null
-      : window.setTimeout(() => {
-          Promise.all([checkForUpdates(), getSettingsSnapshot()])
-            .then(([update, settings]) => {
-              if (settings.autoDownloadUpdates && update.canDownload) {
-                void downloadUpdate().catch(() => {});
-              }
-            })
-            .catch(() => {});
-        }, 2_000);
-
     const unlistenSettingsChangePromise = isSettingsWindow()
       ? listen<string>("settings-change-tab", () => {
           void reloadBootstrapState()
@@ -132,7 +116,6 @@ function AppInner() {
       void unlistenSettingsChangePromise
         .then((unlisten) => unlisten?.())
         .catch(() => {});
-      if (updateTimer !== null) window.clearTimeout(updateTimer);
       window.removeEventListener("codexbar:settings-updated", onSettingsUpdated);
     };
   }, [auxiliaryWindow, reloadBootstrapState]);

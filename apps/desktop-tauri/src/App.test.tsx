@@ -157,6 +157,23 @@ describe("App window-label routing", () => {
     eventMocks.listen.mockResolvedValue(() => {});
   });
 
+  it("never checks for updates on startup", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      render(<App />);
+
+      await waitFor(() => {
+        expect(tauriMocks.getBootstrapState).toHaveBeenCalled();
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(tauriMocks.checkForUpdates).not.toHaveBeenCalled();
+      expect(tauriMocks.downloadUpdate).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("routes the dedicated flyout window to the taskbar glance surface", async () => {
     webviewWindowMocks.label = "flyout";
 

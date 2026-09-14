@@ -128,6 +128,17 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, UpdateCheckError>
     check_for_updates_with_channel(UpdateChannel::Stable).await
 }
 
+/// Always reports "no newer release" without any network call.
+///
+/// This fork does not check for updates. [`check_github_releases`] below keeps
+/// the upstream implementation intact so merges still apply; call it from here
+/// to restore checking.
+pub async fn check_for_updates_with_channel(
+    _channel: UpdateChannel,
+) -> Result<Option<UpdateInfo>, UpdateCheckError> {
+    Ok(None)
+}
+
 /// Check for updates from GitHub releases with a specific channel
 ///
 /// When `channel` is `UpdateChannel::Beta`, includes pre-release versions.
@@ -135,7 +146,8 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, UpdateCheckError>
 ///
 /// SBS-931: only a successful "latest is not newer" is `Ok(None)` (Idle).
 /// Network, HTTP, and parse failures are `Err`.
-pub async fn check_for_updates_with_channel(
+#[allow(dead_code)]
+async fn check_github_releases(
     channel: UpdateChannel,
 ) -> Result<Option<UpdateInfo>, UpdateCheckError> {
     let client = update_client().ok_or(UpdateCheckError::Client)?;
