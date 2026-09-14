@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use reqwest::header::{HeaderValue, RETRY_AFTER};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -69,7 +70,10 @@ pub struct ClaudeOAuthFetcher {
     config_dir: Option<PathBuf>,
 }
 
-static RATE_LIMIT_BACKOFF_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+// Keyed by account. A single shared gate let one account's 429 return
+// "rate limited" for every other Claude account until the backoff expired,
+// and only a successful fetch cleared it, so no account could recover it.
+static RATE_LIMIT_BACKOFF_UNTIL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 impl ClaudeOAuthFetcher {
     const USAGE_URL: &'static str = "https://api.anthropic.com/api/oauth/usage";
@@ -270,7 +274,7 @@ impl ClaudeOAuthFetcher {
             )));
         }
 
-        if let Some(remaining) = Self::rate_limit_backoff_remaining() {
+        if let Some(remaining) = self.rate_limit_backoff_remaining() {
             return Err(Self::rate_limited_error(remaining));
         }
 
@@ -305,7 +309,7 @@ impl ClaudeOAuthFetcher {
             }
 
             if status.as_u16() == 429 {
-                Self::record_rate_limit(retry_after);
+                self.record_rate_limit(retry_after);
                 return Err(Self::rate_limited_error(retry_after));
             }
 
@@ -321,35 +325,43 @@ impl ClaudeOAuthFetcher {
             .await
             .map_err(|e| ProviderError::Parse(format!("Failed to parse OAuth response: {}", e)))?;
 
-        Self::clear_rate_limit();
+        self.clear_rate_limit();
         Ok(usage)
     }
 
-    fn rate_limit_gate() -> &'static Mutex<Option<Instant>> {
-        RATE_LIMIT_BACKOFF_UNTIL.get_or_init(|| Mutex::new(None))
+    fn rate_limit_gate() -> &'static Mutex<HashMap<String, Instant>> {
+        RATE_LIMIT_BACKOFF_UNTIL.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn rate_limit_backoff_remaining() -> Option<Duration> {
+    fn rate_limit_key(&self) -> String {
+        self.config_dir
+            .as_ref()
+            .map(|dir| dir.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    }
+
+    fn rate_limit_backoff_remaining(&self) -> Option<Duration> {
+        let key = self.rate_limit_key();
         let mut guard = Self::rate_limit_gate().lock().ok()?;
-        let until = (*guard)?;
+        let until = *guard.get(&key)?;
         let now = Instant::now();
         if until <= now {
-            *guard = None;
+            guard.remove(&key);
             None
         } else {
             Some(until.saturating_duration_since(now))
         }
     }
 
-    fn record_rate_limit(duration: Duration) {
+    fn record_rate_limit(&self, duration: Duration) {
         if let Ok(mut guard) = Self::rate_limit_gate().lock() {
-            *guard = Some(Instant::now() + duration);
+            guard.insert(self.rate_limit_key(), Instant::now() + duration);
         }
     }
 
-    fn clear_rate_limit() {
+    fn clear_rate_limit(&self) {
         if let Ok(mut guard) = Self::rate_limit_gate().lock() {
-            *guard = None;
+            guard.remove(&self.rate_limit_key());
         }
     }
 
@@ -456,7 +468,7 @@ fn format_reset_date(date: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeOAuthCredentials, ClaudeOAuthFetcher, OAuthUsageResponse, UsageWindow,
+        ClaudeOAuthCredentials, ClaudeOAuthFetcher, OAuthUsageResponse, PathBuf, UsageWindow,
         UtilizationScale,
     };
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
@@ -712,13 +724,41 @@ mod tests {
 
     #[test]
     fn rate_limit_gate_blocks_and_clears() {
-        ClaudeOAuthFetcher::clear_rate_limit();
+        let fetcher = ClaudeOAuthFetcher::with_config_dir(PathBuf::from("/gate/blocks-and-clears"));
+        fetcher.clear_rate_limit();
 
-        ClaudeOAuthFetcher::record_rate_limit(Duration::from_secs(30));
-        assert!(ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_some());
+        fetcher.record_rate_limit(Duration::from_secs(30));
+        assert!(fetcher.rate_limit_backoff_remaining().is_some());
 
-        ClaudeOAuthFetcher::clear_rate_limit();
-        assert!(ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_none());
+        fetcher.clear_rate_limit();
+        assert!(fetcher.rate_limit_backoff_remaining().is_none());
+    }
+
+    #[test]
+    fn rate_limited_account_does_not_gate_another_account() {
+        let limited = ClaudeOAuthFetcher::with_config_dir(PathBuf::from("/gate/limited-account"));
+        let other = ClaudeOAuthFetcher::with_config_dir(PathBuf::from("/gate/other-account"));
+        limited.clear_rate_limit();
+        other.clear_rate_limit();
+
+        limited.record_rate_limit(Duration::from_secs(3600));
+
+        assert!(limited.rate_limit_backoff_remaining().is_some());
+        assert!(other.rate_limit_backoff_remaining().is_none());
+
+        limited.clear_rate_limit();
+    }
+
+    #[test]
+    fn rate_limit_key_is_case_insensitive_for_the_same_directory() {
+        let lower = ClaudeOAuthFetcher::with_config_dir(PathBuf::from("/gate/Case-Dir"));
+        let upper = ClaudeOAuthFetcher::with_config_dir(PathBuf::from("/GATE/CASE-DIR"));
+        lower.clear_rate_limit();
+
+        lower.record_rate_limit(Duration::from_secs(30));
+        assert!(upper.rate_limit_backoff_remaining().is_some());
+
+        lower.clear_rate_limit();
     }
 
     #[test]
